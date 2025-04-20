@@ -50,6 +50,8 @@ module_param(apsd_result_force_sdp, int, 0644);
 MODULE_PARM_DESC(apsd_result_force_sdp, "APSD result force SDP");
 #endif
 
+static unsigned int bypass_charging = 0;
+
 static bool is_secure(struct smb_charger *chg, int addr)
 {
 	if (addr == SHIP_MODE_REG || addr == FREQ_CLK_DIV_REG)
@@ -2173,9 +2175,13 @@ int smblib_get_prop_charge_full(struct smb_charger *chg,
 int smblib_get_prop_input_suspend(struct smb_charger *chg,
 				  union power_supply_propval *val)
 {
-	val->intval
-		= (get_client_vote(chg->usb_icl_votable, USER_VOTER) == 0)
-		 && get_client_vote(chg->dc_suspend_votable, USER_VOTER);
+	if (get_client_vote(chg->chg_disable_votable, BYPASS_VOTER) == 1) {
+    	val->intval = 1;
+    } else if (bypass_charging) {
+    	val->intval = 2;
+    } else {
+    	val->intval = 0;
+    }
 	return 0;
 }
 
@@ -2779,11 +2785,15 @@ int smblib_set_prop_input_suspend(struct smb_charger *chg,
 	int rc;
 
 	/* vote 0mA when suspended */
-	rc = vote(chg->usb_icl_votable, USER_VOTER, (bool)val->intval, 0);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't vote to %s USB rc=%d\n",
-			(bool)val->intval ? "suspend" : "resume", rc);
-		return rc;
+	if (val->intval == 1) {
+		rc = vote(chg->chg_disable_votable, BYPASS_VOTER, 1, 0);
+		bypass_charging = 0;
+	} else if (val->intval == 2) {
+		rc = vote(chg->chg_disable_votable, BYPASS_VOTER, 0, 0);
+		bypass_charging = 1;
+	} else {
+		rc = vote(chg->chg_disable_votable, BYPASS_VOTER, 0, 0);
+		bypass_charging = 0;
 	}
 
 	rc = vote(chg->dc_suspend_votable, USER_VOTER, (bool)val->intval, 0);
@@ -2835,6 +2845,7 @@ static void smblib_somc_thermal_fake_charging_work(struct work_struct *work)
 int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 				const union power_supply_propval *val)
 {
+	int fake_temp_level;
 #if !defined(CONFIG_SOMC_CHARGER_EXTENSION)
 	if (val->intval < 0)
 		return -EINVAL;
@@ -2869,6 +2880,19 @@ int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 		schedule_work(&chg->thermal_fake_charging_work);
 
 	chg->system_temp_level = val->intval;
+
+	if (get_client_vote(chg->chg_disable_votable, BYPASS_VOTER) == 1) {
+		pr_info("%s bypass charging enabled",__FUNCTION__);
+		return vote(chg->chg_disable_votable, THERMAL_DAEMON_VOTER, true, 0);
+	}
+
+	if (bypass_charging) {
+		fake_temp_level = chg->system_temp_level-2;
+		if (fake_temp_level < 0) fake_temp_level = 0;
+		pr_info("%s limited charging enabled %d",__FUNCTION__, fake_temp_level);
+		return vote(chg->fcc_votable, THERMAL_DAEMON_VOTER, true,
+			chg->thermal_fcc_ua[fake_temp_level]);
+	}
 
 	smblib_somc_thermal_fcc_change(chg);
 	smblib_somc_thermal_icl_change(chg);
